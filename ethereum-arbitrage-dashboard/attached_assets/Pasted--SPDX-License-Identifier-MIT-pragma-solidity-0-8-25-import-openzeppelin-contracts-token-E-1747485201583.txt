@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.25;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+interface IAaveLendingPool {
+    function flashLoan(
+        address receiver,
+        address[] calldata assets,
+        uint256[] calldata amounts,
+        uint256[] calldata modes,
+        address onBehalfOf,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
+}
+
+interface IUniswapV2Router {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+}
+
+contract CrashSafeArbitrageBot is Ownable, ReentrancyGuard {
+    // --- CONFIG ---
+    enum BotStatus { Idle, Running, Paused, Scanning, Executing, Frozen }
+    BotStatus public currentStatus;
+    bool public isFrozen;
+
+    address public constant USDC = 0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
+    address public constant WETH = 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
+    IAaveLendingPool public constant AAVE = IAaveLendingPool(0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951);
+    IUniswapV2Router public constant UNISWAP = IUniswapV2Router(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+    IUniswapV2Router public constant SUSHISWAP = IUniswapV2Router(0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F);
+    AggregatorV3Interface public constant ETH_USD = AggregatorV3Interface(0x694AA1769357215DE4FAC081bf1f309aDC325306);
+
+    address public vault;
+    uint256 public lastTradeTime;
+    uint256 public constant COOLDOWN = 5 minutes;
+    uint256 public constant AUTO_TRANSFER_THRESHOLD = 500 * 1e6;
+    uint256 public totalRevenue;
+    uint256 public totalLoss;
+    uint256 public lastProfit;
+    uint256 public slippageTolerance = 50; // 0.5%
+
+    constructor(address _vault) Ownable(msg.sender) {
+        vault = _vault;
+        currentStatus = BotStatus.Idle;
+    }
+
+    // --- EVENTS ---
+    event StatusChanged(BotStatus status, string reason);
+    event TradeExecuted(uint256 profit, uint256 gasUsed);
+    event TradeFailed(string reason);
+    event TransferToVault(uint256 amount);
+    event AssetsLiquidated(uint256 amount);
+    event GasStats(uint256 gasUsed, uint256 gasPrice, uint256 estProfit, string note);
+    event BotFrozen();
+    event OracleStatus(bool isFresh);
+    event Diagnostics(string chain, uint256 profit, uint256 slippage, bool oracle, string error);
+
+    // --- MODIFIERS ---
+    modifier onlyActive() {
+        require(!isFrozen && currentStatus != BotStatus.Paused, "Bot is paused or frozen");
+        _;
+    }
+
+    modifier checkOracleFreshness() {
+        (, , uint256 updatedAt, ) = ETH_USD.latestRoundData();
+        bool fresh = (block.timestamp - updatedAt < 1 hours);
+        emit OracleStatus(fresh);
+        require(fresh, "Oracle data is stale");
+        _;
+    }
+
+    // --- CONTROL FUNCTIONS ---
+    function pause() external onlyOwner {
+        currentStatus = BotStatus.Paused;
+        emit StatusChanged(currentStatus, "Paused by owner");
+    }
+
+    function resume() external onlyOwner {
+        require(currentStatus == BotStatus.Paused || isFrozen, "Not paused/frozen");
+        isFrozen = false;
+        currentStatus = BotStatus.Idle;
+        emit StatusChanged(currentStatus, "Resumed");
+    }
+
+    function freeze() external onlyOwner {
+        isFrozen = true;
+        currentStatus = BotStatus.Frozen;
+        emit BotFrozen();
+        emit StatusChanged(currentStatus, "Emergency freeze");
+    }
+
+    function diagnose() external view returns (string memory, uint256, uint256, bool, string memory) {
+        (, , uint256 updatedAt, ) = ETH_USD.latestRoundData();
+        bool fresh = (block.timestamp - updatedAt < 1 hours);
+        return ("Sepolia", lastProfit, slippageTolerance, fresh, isFrozen ? "Frozen" : "OK");
+    }
+
+    // --- EXECUTION LOGIC ---
+    function startArbitrage(uint256 wethAmount) external onlyOwner onlyActive nonReentrant checkOracleFreshness {
+        require(block.timestamp >= lastTradeTime + COOLDOWN, "Cooldown active");
+
+        address ;
+        assets[0] = WETH;
+
+        uint256 ;
+        amounts[0] = wethAmount;
+
+        uint256 ;
+        modes[0] = 0;
+
+        currentStatus = BotStatus.Executing;
+        emit StatusChanged(currentStatus, "Starting flashloan");
+
+        AAVE.flashLoan(
+            address(this),
+            assets,
+            amounts,
+            modes,
+            address(this),
+            new bytes(0),
+            0
+        );
+    }
+
+    function executeOperation(
+        address[] calldata,
+        uint256[] calldata amounts,
+        uint256[] calldata premiums,
+        address initiator,
+        bytes calldata
+    ) external returns (bool) {
+        require(msg.sender == address(AAVE), "Invalid sender");
+        require(initiator == address(this), "Unauthorized");
+
+        uint256 gasStart = gasleft();
+        uint256 initialBalance = IERC20(USDC).balanceOf(address(this));
+
+        _attemptArbitrage(amounts[0]);
+
+        uint256 finalBalance = IERC20(USDC).balanceOf(address(this));
+        uint256 profit = (finalBalance > initialBalance) ? finalBalance - initialBalance : 0;
+        lastProfit = profit;
+
+        if (profit >= AUTO_TRANSFER_THRESHOLD) {
+            IERC20(USDC).transfer(vault, AUTO_TRANSFER_THRESHOLD);
+            totalRevenue += AUTO_TRANSFER_THRESHOLD;
+            emit TransferToVault(AUTO_TRANSFER_THRESHOLD);
+        } else {
+            totalLoss += (AUTO_TRANSFER_THRESHOLD - profit);
+        }
+
+        uint256 totalDebt = amounts[0] + premiums[0];
+        IERC20(WETH).approve(address(AAVE), totalDebt);
+        IERC20(WETH).transfer(address(AAVE), totalDebt);
+
+        uint256 gasUsed = gasStart - gasleft();
+        emit TradeExecuted(profit, gasUsed);
+        emit GasStats(gasUsed, tx.gasprice, profit, "");
+
+        currentStatus = BotStatus.Idle;
+        lastTradeTime = block.timestamp;
+        return true;
+    }
+
+    function _attemptArbitrage(uint256 wethAmount) internal {
+        address ;
+        path[0] = WETH;
+        path[1] = USDC;
+
+        IERC20(WETH).approve(address(UNISWAP), wethAmount / 2);
+        UNISWAP.swapExactTokensForTokens(wethAmount / 2, 0, path, address(this), block.timestamp + 300);
+
+        uint256 usdcBalance = IERC20(USDC).balanceOf(address(this));
+        path[0] = USDC;
+        path[1] = WETH;
+        IERC20(USDC).approve(address(SUSHISWAP), usdcBalance);
+        SUSHISWAP.swapExactTokensForTokens(usdcBalance, 0, path, address(this), block.timestamp + 300);
+    }
+
+    function getBalances() external view returns (address[] memory tokens, uint256[] memory balances) {
+        tokens = new address ;
+        balances = new uint256 ;
+        tokens[0] = USDC; tokens[1] = WETH;
+        balances[0] = IERC20(USDC).balanceOf(address(this));
+        balances[1] = IERC20(WETH).balanceOf(address(this));
+    }
+
+    function withdrawToken(address token) external onlyOwner {
+        IERC20(token).transfer(owner(), IERC20(token).balanceOf(address(this)));
+    }
+
+    receive() external payable {}
+}
